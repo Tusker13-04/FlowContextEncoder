@@ -1,0 +1,40 @@
+# =============================================================
+# Pretrain config — self-supervised contrastive pretraining
+# on large unlabelled corpora (CESNET-TLS/QUIC, MAWI).
+# Inherits defaults from configs/default.yaml; values here override.
+# =============================================================
+
+_base_: default.yaml
+
+train:
+  lr: 1.0e-4              # Lower LR for stable unsupervised pretraining
+  batch_size: 256         # Larger batch = more negatives for InfoNCE / SimCLR
+  epochs: 200
+  warmup_epochs: 20       # Longer warmup to avoid early collapse
+  grad_clip: 1.0
+
+loss:
+  type: simclr            # Self-supervised: SimCLR (no labels needed)
+  tau: 0.07
+
+# ── Augmentation (applied per flow during pretraining) ──────
+augmentation:
+  enabled: true
+  strategies:
+    - jitter_iat           # ± 10% noise on inter-arrival times
+    - scale_rtt            # multiply RTT by U(0.8, 1.2)
+    - random_packet_drop   # drop 5–15% of packets, re-pad
+    - resample_segment     # randomly crop and re-pad to N=128
+  two_views: true         # produce two augmented views per flow for contrastive pair
+
+data:
+  sources:
+    - cesnet_quic22
+    - cesnet_tls22
+    - mawi
+  # No app labels required — unsupervised
+  require_labels: false
+
+logging:
+  wandb: false
+  project: FlowContextEncoder-Pretrain

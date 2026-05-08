@@ -1,0 +1,52 @@
+# =============================================================
+# Fine-tune config — supervised contrastive fine-tuning
+# on labelled 5G + in-house lab captures.
+# Load pretrained encoder checkpoint, freeze first n_freeze layers,
+# then fine-tune with SupCon loss.
+# =============================================================
+
+_base_: default.yaml
+
+train:
+  lr: 5.0e-5              # Lower than pretrain — we are refining, not learning from scratch
+  batch_size: 64
+  epochs: 50
+  warmup_epochs: 3
+  grad_clip: 1.0
+
+finetune:
+  checkpoint: null        # path to pretrained .pt checkpoint; set at runtime
+  n_freeze_layers: 2      # freeze first 2 MambaBlocks, fine-tune the rest + projection head
+  reinit_projection: true # reinitialise the projection MLP head for new embedding space
+
+loss:
+  type: supcon
+  tau: 0.07
+
+data:
+  sources:
+    - fiveg
+    - lab_captures
+  require_labels: true
+  coarse_classes:
+    - video_streaming
+    - gaming
+    - voip
+    - web
+    - xr
+
+augmentation:
+  enabled: true
+  strategies:
+    - jitter_iat
+    - scale_rtt
+  two_views: false        # supervised: single view per sample, labels drive positives
+
+eval:
+  knn_k: 5
+  eval_every_n_epochs: 2
+  report_fewshot: true    # run few-shot eval on held-out fewshot.txt apps
+
+logging:
+  wandb: false
+  project: FlowContextEncoder-Finetune

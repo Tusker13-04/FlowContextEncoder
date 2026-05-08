@@ -1,57 +1,59 @@
-# FlowContextEncoder — default hyper-parameters (Phase 0)
-# Override any field via CLI:  python train.py --config configs/default.yaml key=value
+# =============================================================
+# FlowContextEncoder — Canonical Hyperparameters
+# All other configs inherit from / override these values.
+# =============================================================
 
-# ── Data ──────────────────────────────────────────────────────────────────────
-data:
-  npz_train: null          # path to train .npz; null = use synthetic data
-  npz_val:   null          # path to val   .npz; null = use synthetic data
-  n_synth_train: 2000      # synthetic flows for training  (ignored if npz_train set)
-  n_synth_val:   400       # synthetic flows for validation
-  n_classes: 5             # video / gaming / VoIP / bulk / XR
-  max_len: 128             # max packets per flow (pad/truncate)
-  batch_size: 64
-  num_workers: 0           # set >0 on Linux for multiprocess loading
-
-# ── Model ─────────────────────────────────────────────────────────────────────
+# ── Model architecture ──────────────────────────────────────
 model:
-  d_in: 6                  # per-packet feature dim  (matches features.py D_IN)
-  d_ctx: 4                 # context vector dim       (matches features.py D_CTX)
-  d_model: 64              # internal model dimension
-  d_embed: 128             # output embedding dimension
-  n_layers: 3              # number of MambaBlocks
-  d_state: 16              # SSM state size
-  d_conv: 4                # causal conv kernel size
-  expand: 2                # d_inner = d_model * expand
-  max_len: 128             # must match data.max_len
-  proj_mult: 2             # MLP head hidden = d_model * proj_mult
+  d_model: 128          # Packet-token embedding dimension
+  d_inner: 256          # SSM inner (expanded) dimension  (2× d_model)
+  d_ctx: 16             # Network-context vector dimension (RTT, jitter, loss, throughput)
+  n_layers: 4           # Number of MambaBlocks
+  seq_len: 128          # N — packets per flow (truncate/pad target)
+  embed_dim: 128        # Output embedding dimension (L2-normalised)
+  d_state: 16           # SSM state dimension
+  d_conv: 4             # Causal conv1d kernel width
+  dt_rank: 8            # Rank of Delta (Δ) projection
+  dropout: 0.1
 
-# ── Loss ──────────────────────────────────────────────────────────────────────
-loss:
-  temperature: 0.07        # SupConLoss temperature τ
-
-# ── Optimiser ─────────────────────────────────────────────────────────────────
-optimiser:
-  name: AdamW
-  lr: 3.0e-4
-  weight_decay: 1.0e-2
-  betas: [0.9, 0.999]
-
-# ── Scheduler ─────────────────────────────────────────────────────────────────
-scheduler:
-  name: CosineAnnealingLR
-  T_max: 30                # = n_epochs
-  eta_min: 1.0e-6
-
-# ── Training ──────────────────────────────────────────────────────────────────
+# ── Training ────────────────────────────────────────────────
 train:
-  n_epochs: 30
-  log_every: 5             # log metrics every N epochs
-  save_dir: checkpoints/
-  save_best: true          # save checkpoint with lowest val loss
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  batch_size: 64
+  epochs: 100
+  warmup_epochs: 5
+  grad_clip: 1.0
   seed: 42
 
-# ── Evaluation ────────────────────────────────────────────────────────────────
+# ── Loss ────────────────────────────────────────────────────
+loss:
+  type: supcon            # supcon | arcface | simclr
+  tau: 0.07               # Temperature for SupCon / SimCLR
+  arcface_margin: 0.3     # m for ArcFace (used when type=arcface)
+  arcface_scale: 32       # s for ArcFace
+
+# ── Data ────────────────────────────────────────────────────
+data:
+  flow_dir: data/flows
+  splits_dir: splits
+  num_workers: 4
+  pin_memory: true
+  coarse_classes:
+    - video_streaming
+    - gaming
+    - voip
+    - web
+    - xr
+
+# ── Evaluation ──────────────────────────────────────────────
 eval:
-  knn_k: 5                 # k for k-NN classifier on embeddings
-  intra_class_target: 0.7  # KPI: intra-class cosine sim
-  inter_class_target: 0.3  # KPI: inter-class cosine sim (must be < this)
+  knn_k: 5
+  eval_every_n_epochs: 5
+  save_best_metric: intra_cos_sim   # checkpoint on best intra-class cosine similarity
+
+# ── Logging ─────────────────────────────────────────────────
+logging:
+  wandb: false            # set true to enable W&B logging
+  project: FlowContextEncoder
+  log_every_n_steps: 50
