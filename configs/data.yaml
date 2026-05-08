@@ -1,0 +1,26 @@
+# Phase 0 — data pipeline configuration
+# These values are consumed by build_loaders() and FlowFeatureExtractor.
+
+data:
+  # Source path — override at runtime, e.g.:
+  #   python train.py data.source=data/flows.csv
+  source: data/flows.csv
+
+  max_packets: 128      # truncate flows longer than this
+  min_packets: 4        # discard flows shorter than this
+
+  batch_size:  64
+  val_split:   0.15
+  test_split:  0.10
+  num_workers: 0        # keep 0 on Windows; set 4 on Linux
+  pin_memory:  false    # set true when training on CUDA
+  seed:        42
+
+  # Label map (optional) — maps application name strings to int class ids.
+  # Auto-built at runtime if absent.
+  label_map: {}
+
+# Feature dimensions — must match model.d_in and model.d_ctx
+features:
+  packet_feat_dim: 6
+  ctx_feat_dim:    4

@@ -1,117 +1,164 @@
 """
-Feature extraction helpers.
+Phase 0 — Feature extraction.
 
-Per-packet features (d_in = 6):
-  [0] direction        : 0 = client→server, 1 = server→client
-  [1] pkt_size_norm    : packet size / 1500  (normalised by max Ethernet MTU)
-  [2] iat_log          : log1p(inter-arrival time in ms)
-  [3] tcp_flag_bits    : packed TCP flags / 64  (0..1)
-  [4] is_quic          : 1 if QUIC, 0 otherwise
-  [5] position_frac    : t / (N-1)  — relative position in the flow
+Converts a raw flow (list of packet dicts) into two tensors:
 
-Flow-level context vector (d_ctx = 4):
-  [0] rtt_ms_norm      : RTT estimate in ms / 500
-  [1] jitter_norm      : jitter in ms / 100
-  [2] retransmit_rate  : retransmissions / total packets  (0..1)
-  [3] pkt_rate_norm    : packets per second / 1000
+  packets : (N, PACKET_FEAT_DIM)  — per-packet feature matrix
+  ctx     : (CTX_FEAT_DIM,)       — per-flow context vector
+
+Packet features  (6-dim, PACKET_FEAT_DIM = 6)
+  0  direction           +1 = client→server, -1 = server→client
+  1  packet_size         bytes, log1p-normalised
+  2  inter_arrival_time  seconds since previous packet in this flow, log1p-normalised
+  3  tcp_flag_syn        0/1
+  4  tcp_flag_ack        0/1
+  5  tcp_flag_fin        0/1
+
+Context features  (4-dim, CTX_FEAT_DIM = 4)
+  0  rtt_ms        round-trip time in milliseconds, log1p-normalised
+  1  jitter_ms     jitter in ms, log1p-normalised
+  2  pkt_loss_rate fraction of retransmitted packets [0, 1]
+  3  throughput    bytes/second, log1p-normalised
+
+All features are float32.  Unknown / missing values are filled with 0.
 """
 
 from __future__ import annotations
 
-import numpy as np
-from typing import Dict, Any
+import math
+from typing import Any
+
+import torch
+
+# ── Public constants (consumed by model.__init__ as d_in / d_ctx) ────────────
+PACKET_FEAT_DIM: int = 6
+CTX_FEAT_DIM: int    = 4
 
 
-D_IN  = 6   # per-packet feature dimension
-D_CTX = 4   # context feature dimension
-
-
-def extract_flow_features(
-    packets: list[Dict[str, Any]],
-    rtt_ms: float = 20.0,
-    jitter_ms: float = 2.0,
-    retransmit_rate: float = 0.0,
-    pkt_rate: float = 100.0,
-) -> tuple[np.ndarray, np.ndarray]:
+class FlowFeatureExtractor:
     """
-    Extract per-packet feature matrix and flow context vector from a list of
-    packet dicts.  Each dict should have:
-        direction  : int   (0 or 1)
-        size       : int   (bytes)
-        iat_ms     : float (inter-arrival time in ms, 0 for first packet)
-        tcp_flags  : int   (0..63 — 6 TCP flag bits packed)
-        is_quic    : bool
+    Stateless extractor — no fitting required.
 
-    Returns:
-        pkt_feats : np.ndarray  (N, D_IN)   float32
-        ctx_feats : np.ndarray  (D_CTX,)    float32
+    Parameters
+    ----------
+    max_packets : int
+        Truncate flows longer than this (default 128).
+    min_packets : int
+        Flows shorter than this are skipped during dataset construction.
     """
-    N = len(packets)
-    pkt_feats = np.zeros((N, D_IN), dtype=np.float32)
 
-    for t, pkt in enumerate(packets):
-        pkt_feats[t, 0] = float(pkt.get("direction", 0))
-        pkt_feats[t, 1] = min(pkt.get("size", 0) / 1500.0, 1.0)
-        pkt_feats[t, 2] = float(np.log1p(max(pkt.get("iat_ms", 0.0), 0.0)))
-        pkt_feats[t, 3] = min(pkt.get("tcp_flags", 0) / 64.0, 1.0)
-        pkt_feats[t, 4] = float(pkt.get("is_quic", False))
-        pkt_feats[t, 5] = t / max(N - 1, 1)
+    def __init__(self, max_packets: int = 128, min_packets: int = 4):
+        self.max_packets = max_packets
+        self.min_packets = min_packets
 
-    ctx_feats = np.array([
-        min(rtt_ms / 500.0, 1.0),
-        min(jitter_ms / 100.0, 1.0),
-        min(retransmit_rate, 1.0),
-        min(pkt_rate / 1000.0, 1.0),
-    ], dtype=np.float32)
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    return pkt_feats, ctx_feats
+    def extract(
+        self,
+        pkts: list[dict[str, Any]],
+        flow_meta: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        pkts : list of dicts, each with keys:
+            'direction'   : int   +1 | -1
+            'size'        : int   bytes
+            'timestamp'   : float seconds (absolute)
+            'tcp_flags'   : int   bitmask  (SYN=0x02, ACK=0x10, FIN=0x01)  [optional]
+
+        flow_meta : dict with optional keys:
+            'rtt_ms'        : float
+            'jitter_ms'     : float
+            'pkt_loss_rate' : float   [0, 1]
+            'throughput'    : float   bytes/s
+
+        Returns
+        -------
+        packets : torch.Tensor  (N, PACKET_FEAT_DIM)  float32
+        ctx     : torch.Tensor  (CTX_FEAT_DIM,)       float32
+        """
+        pkts = pkts[: self.max_packets]
+        n    = len(pkts)
+
+        rows = torch.zeros(n, PACKET_FEAT_DIM, dtype=torch.float32)
+        prev_ts: float | None = None
+
+        for i, p in enumerate(pkts):
+            rows[i, 0] = float(p.get("direction", 1))
+            rows[i, 1] = math.log1p(float(p.get("size", 0)))
+
+            ts = float(p.get("timestamp", 0.0))
+            if prev_ts is not None:
+                rows[i, 2] = math.log1p(max(ts - prev_ts, 0.0))
+            prev_ts = ts
+
+            flags = int(p.get("tcp_flags", 0))
+            rows[i, 3] = float(bool(flags & 0x02))  # SYN
+            rows[i, 4] = float(bool(flags & 0x10))  # ACK
+            rows[i, 5] = float(bool(flags & 0x01))  # FIN
+
+        ctx = self._extract_ctx(flow_meta or {})
+        return rows, ctx
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_ctx(meta: dict[str, Any]) -> torch.Tensor:
+        c = torch.zeros(CTX_FEAT_DIM, dtype=torch.float32)
+        c[0] = math.log1p(float(meta.get("rtt_ms",        0.0)))
+        c[1] = math.log1p(float(meta.get("jitter_ms",     0.0)))
+        c[2] = float(meta.get("pkt_loss_rate", 0.0))
+        c[3] = math.log1p(float(meta.get("throughput",    0.0)))
+        return c
 
 
-def make_synthetic_flow(
-    app_type: int,
-    n_packets: int = 64,
-    rng: np.random.Generator | None = None,
-) -> tuple[np.ndarray, np.ndarray, int]:
+# ── Convenience: derive context from packet list alone ────────────────────────
+
+def derive_context_from_packets(
+    pkts: list[dict[str, Any]],
+) -> dict[str, float]:
     """
-    Generate a synthetic flow for unit-testing and smoke-tests.
+    Heuristically estimate RTT, jitter, loss, and throughput from raw
+    packet timestamps and sizes alone — useful when Zeek conn.log is
+    unavailable (e.g., working from plain pcap).
 
-    App type statistics (rough approximation):
-        0  video streaming  — large packets, moderate IAT, low jitter
-        1  gaming           — small packets, low IAT, variable jitter
-        2  VoIP             — tiny packets, very regular IAT, low jitter
-        3  bulk transfer    — max-size packets, bursty IAT
-        4  XR / immersive   — mix of small control + large media packets
+    Estimates
+    ---------
+    rtt_ms        : 2 × median inter-arrival time of SYN→SYN/ACK pairs
+                    (falls back to 2 × median forward IAT)
+    jitter_ms     : std-dev of all inter-arrival times
+    pkt_loss_rate : fraction of RTX-flagged packets (tcp_flags has PSH+ACK
+                    without prior data ACK — rough proxy; 0 if unavailable)
+    throughput    : total bytes / flow duration in seconds
     """
-    if rng is None:
-        rng = np.random.default_rng()
+    import statistics
 
-    profiles = {
-        0: dict(size_mu=1200, size_std=200, iat_mu=5,  iat_std=1,  jitter=2,  rtt=30),
-        1: dict(size_mu=120,  size_std=60,  iat_mu=16, iat_std=8,  jitter=10, rtt=20),
-        2: dict(size_mu=160,  size_std=20,  iat_mu=20, iat_std=1,  jitter=1,  rtt=15),
-        3: dict(size_mu=1450, size_std=50,  iat_mu=1,  iat_std=5,  jitter=3,  rtt=40),
-        4: dict(size_mu=600,  size_std=400, iat_mu=8,  iat_std=4,  jitter=8,  rtt=25),
+    if not pkts:
+        return {"rtt_ms": 0.0, "jitter_ms": 0.0, "pkt_loss_rate": 0.0, "throughput": 0.0}
+
+    timestamps = [float(p.get("timestamp", 0.0)) for p in pkts]
+    sizes      = [float(p.get("size",      0))   for p in pkts]
+
+    iats: list[float] = []
+    for i in range(1, len(timestamps)):
+        iat = (timestamps[i] - timestamps[i - 1]) * 1000.0  # → ms
+        if iat >= 0:
+            iats.append(iat)
+
+    rtt_ms    = 2.0 * statistics.median(iats) if iats else 0.0
+    jitter_ms = statistics.stdev(iats)         if len(iats) > 1 else 0.0
+
+    duration   = max(timestamps[-1] - timestamps[0], 1e-6)
+    throughput = sum(sizes) / duration  # bytes/s
+
+    return {
+        "rtt_ms":        rtt_ms,
+        "jitter_ms":     jitter_ms,
+        "pkt_loss_rate": 0.0,     # cannot derive from IAT alone
+        "throughput":    throughput,
     }
-    p = profiles.get(app_type % 5, profiles[0])
-
-    packets = []
-    for t in range(n_packets):
-        packets.append({
-            "direction":  int(rng.integers(0, 2)),
-            "size":       int(np.clip(rng.normal(p["size_mu"], p["size_std"]), 40, 1500)),
-            "iat_ms":     float(np.clip(rng.normal(p["iat_mu"], p["iat_std"]), 0.0, 500.0)),
-            "tcp_flags":  int(rng.integers(0, 64)),
-            "is_quic":    bool(rng.random() < 0.3),
-        })
-
-    rtt    = p["rtt"]  + rng.normal(0, 3)
-    jitter = p["jitter"] + rng.normal(0, 1)
-    pkt_rate = n_packets / max(sum(pk["iat_ms"] for pk in packets) / 1000.0, 0.01)
-
-    feats, ctx = extract_flow_features(
-        packets,
-        rtt_ms=float(np.clip(rtt, 1, 500)),
-        jitter_ms=float(np.clip(jitter, 0, 100)),
-        pkt_rate=float(np.clip(pkt_rate, 1, 1000)),
-    )
-    return feats, ctx, app_type

@@ -1,123 +1,218 @@
 """
-FlowDataset  — a PyTorch Dataset wrapper for pre-extracted flow feature arrays.
+Phase 0 — FlowDataset and collate_flows.
 
-Expected data format  (one .npz file per split):
-    packets  : float32  (M, N_max, D_IN)   — zero-padded packet sequences
-    ctx      : float32  (M, D_CTX)          — per-flow context vectors
-    labels   : int64    (M,)                — integer app-type labels
-    lengths  : int64    (M,)                — true flow length before padding
+FlowDataset accepts three interchange formats:
 
-collate_flows builds the variable-length batch with a boolean padding mask.
+  1. List of raw-packet flows  (list[dict])   — richest, uses FlowFeatureExtractor
+  2. Pre-extracted tensors     (list[tuple])  — (packets_tensor, ctx_tensor, label)
+  3. CSV path                  (str | Path)   — one row per flow, columns described below
+
+CSV schema (minimum required columns)
+  label          : int   class id
+  rtt_ms         : float
+  jitter_ms      : float
+  pkt_loss_rate  : float
+  throughput     : float
+  pkt_sizes      : str   semicolon-separated ints, e.g. "60;1460;800"
+  pkt_dirs       : str   semicolon-separated ints (+1/-1)
+  pkt_times      : str   semicolon-separated floats (absolute seconds)
+  pkt_flags      : str   semicolon-separated ints (tcp flag bitmask) [optional]
 """
 
 from __future__ import annotations
 
-import numpy as np
+from pathlib import Path
+from typing  import Sequence
+
 import torch
 from torch.utils.data import Dataset
-from pathlib import Path
-from typing import Optional
 
-from .features import make_synthetic_flow, D_IN, D_CTX
+from .features import FlowFeatureExtractor, derive_context_from_packets
 
 
 class FlowDataset(Dataset):
     """
-    Args:
-        npz_path   : path to a .npz file with keys packets/ctx/labels/lengths.
-                     If None, generates a synthetic dataset for smoke-testing.
-        max_len    : truncate / pad all flows to this length
-        n_synth    : if npz_path is None, number of synthetic flows to generate
-        n_classes  : number of app-type classes (synthetic mode only)
-        seed       : RNG seed for synthetic generation
+    Parameters
+    ----------
+    source : str | Path | list
+        - str/Path → CSV file
+        - list of (packets_tensor, ctx_tensor, label)  → pre-extracted
+        - list of {'pkts': [...], 'meta': {...}, 'label': int} → raw
+    max_packets : int
+        Truncate / filter flows (default 128).
+    min_packets : int
+        Skip flows shorter than this (default 4).
+    label_map : dict[str, int] | None
+        Optional string→int label mapping (applied when reading CSV with
+        string labels).
     """
 
     def __init__(
         self,
-        npz_path: Optional[str | Path] = None,
-        max_len: int = 128,
-        n_synth: int = 1000,
-        n_classes: int = 5,
-        seed: int = 42,
+        source,
+        max_packets: int = 128,
+        min_packets: int = 4,
+        label_map: dict | None = None,
     ):
-        self.max_len = max_len
+        self.extractor  = FlowFeatureExtractor(max_packets, min_packets)
+        self.label_map  = label_map or {}
+        self._samples: list[tuple[torch.Tensor, torch.Tensor, int]] = []
 
-        if npz_path is not None:
-            data = np.load(npz_path)
-            self.packets = data["packets"].astype(np.float32)
-            self.ctx     = data["ctx"].astype(np.float32)
-            self.labels  = data["labels"].astype(np.int64)
-            self.lengths = data["lengths"].astype(np.int64)
-        else:
-            self._build_synthetic(n_synth, n_classes, max_len, seed)
-
-    def _build_synthetic(
-        self,
-        n_synth: int,
-        n_classes: int,
-        max_len: int,
-        seed: int,
-    ) -> None:
-        rng = np.random.default_rng(seed)
-        pkt_list, ctx_list, lbl_list, len_list = [], [], [], []
-
-        for i in range(n_synth):
-            n_pkts = int(rng.integers(16, max_len + 1))
-            feats, ctx, label = make_synthetic_flow(
-                app_type=i % n_classes,
-                n_packets=n_pkts,
-                rng=rng,
-            )
-            # Pad / truncate to max_len
-            pad = max_len - n_pkts
-            if pad > 0:
-                feats = np.pad(feats, ((0, pad), (0, 0)))
+        if isinstance(source, (str, Path)):
+            self._load_csv(Path(source))
+        elif isinstance(source, (list, tuple)) and len(source) > 0:
+            first = source[0]
+            if isinstance(first, dict):
+                self._load_raw(source)
+            elif isinstance(first, (list, tuple)) and len(first) == 3:
+                self._load_pretensored(source)
             else:
-                feats = feats[:max_len]
-            pkt_list.append(feats)
-            ctx_list.append(ctx)
-            lbl_list.append(label)
-            len_list.append(min(n_pkts, max_len))
+                raise ValueError(
+                    "source list must contain dicts (raw) or "
+                    "3-tuples (packets, ctx, label)."
+                )
+        else:
+            raise TypeError(f"Unsupported source type: {type(source)}")
 
-        self.packets = np.stack(pkt_list).astype(np.float32)
-        self.ctx     = np.stack(ctx_list).astype(np.float32)
-        self.labels  = np.array(lbl_list, dtype=np.int64)
-        self.lengths = np.array(len_list, dtype=np.int64)
+    # ------------------------------------------------------------------
+    # Dataset protocol
+    # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self.labels)
+        return len(self._samples)
 
     def __getitem__(self, idx: int):
-        return (
-            torch.from_numpy(self.packets[idx]),
-            torch.from_numpy(self.ctx[idx]),
-            torch.tensor(self.labels[idx]),
-            torch.tensor(self.lengths[idx]),
-        )
+        packets, ctx, label = self._samples[idx]
+        return packets, ctx, label
 
-    def save(self, path: str | Path) -> None:
-        """Save dataset to .npz for reuse."""
-        np.savez_compressed(
-            path,
-            packets=self.packets,
-            ctx=self.ctx,
-            labels=self.labels,
-            lengths=self.lengths,
-        )
+    # ------------------------------------------------------------------
+    # Loaders
+    # ------------------------------------------------------------------
+
+    def _load_raw(self, records: list[dict]) -> None:
+        for rec in records:
+            pkts  = rec["pkts"]
+            meta  = rec.get("meta") or derive_context_from_packets(pkts)
+            label = self._resolve_label(rec.get("label", 0))
+            if len(pkts) < self.extractor.min_packets:
+                continue
+            packets_t, ctx_t = self.extractor.extract(pkts, meta)
+            self._samples.append((packets_t, ctx_t, label))
+
+    def _load_pretensored(
+        self, records: Sequence[tuple[torch.Tensor, torch.Tensor, int]]
+    ) -> None:
+        for packets, ctx, label in records:
+            self._samples.append(
+                (packets.float(), ctx.float(), int(label))
+            )
+
+    def _load_csv(self, path: Path) -> None:
+        import csv
+
+        with path.open(newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                label = self._resolve_label(row.get("label", "0"))
+
+                sizes  = _parse_seq(row.get("pkt_sizes",  ""), float)
+                dirs   = _parse_seq(row.get("pkt_dirs",   ""), float)
+                times  = _parse_seq(row.get("pkt_times",  ""), float)
+                flags  = _parse_seq(row.get("pkt_flags",  ""), int)
+
+                n = min(len(sizes), len(dirs), len(times))
+                if n < self.extractor.min_packets:
+                    continue
+
+                pkts = [
+                    {
+                        "direction":  dirs[i] if i < len(dirs) else 1,
+                        "size":       sizes[i],
+                        "timestamp":  times[i],
+                        "tcp_flags":  flags[i] if i < len(flags) else 0,
+                    }
+                    for i in range(n)
+                ]
+
+                meta = {
+                    "rtt_ms":        float(row.get("rtt_ms",        0)),
+                    "jitter_ms":     float(row.get("jitter_ms",     0)),
+                    "pkt_loss_rate": float(row.get("pkt_loss_rate", 0)),
+                    "throughput":    float(row.get("throughput",    0)),
+                }
+                # If context cols are all zero, heuristically derive them
+                if all(v == 0.0 for v in meta.values()):
+                    meta = derive_context_from_packets(pkts)
+
+                packets_t, ctx_t = self.extractor.extract(pkts, meta)
+                self._samples.append((packets_t, ctx_t, label))
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_label(self, raw) -> int:
+        if isinstance(raw, int):
+            return raw
+        s = str(raw).strip()
+        if s in self.label_map:
+            return self.label_map[s]
+        try:
+            return int(s)
+        except ValueError:
+            # Auto-assign: string label → next available int
+            idx = len(self.label_map)
+            self.label_map[s] = idx
+            return idx
+
+    @property
+    def num_classes(self) -> int:
+        return len({label for _, _, label in self._samples})
+
+    @property
+    def label_names(self) -> dict[int, str]:
+        return {v: k for k, v in self.label_map.items()}
 
 
-def collate_flows(batch):
+# ── Collate ────────────────────────────────────────────────────────────────────
+
+def collate_flows(
+    batch: list[tuple[torch.Tensor, torch.Tensor, int]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Custom collate function for variable-length flows.
-    Builds a boolean padding mask  (B, N)  where True = real packet.
+    Variable-length flow collation with zero-padding and boolean mask.
+
+    Returns
+    -------
+    packets : (B, N_max, PACKET_FEAT_DIM)   float32, zero-padded
+    ctx     : (B, CTX_FEAT_DIM)             float32
+    mask    : (B, N_max)                    bool   (True = real packet)
+    labels  : (B,)                          int64
     """
-    packets, ctx, labels, lengths = zip(*batch)
-    packets = torch.stack(packets)    # (B, N_max, D_IN)
-    ctx     = torch.stack(ctx)        # (B, D_CTX)
-    labels  = torch.stack(labels)     # (B,)
-    lengths = torch.stack(lengths)    # (B,)
+    packets_list, ctx_list, labels = zip(*batch)
 
-    N = packets.shape[1]
-    mask = torch.arange(N).unsqueeze(0) < lengths.unsqueeze(1)  # (B, N) bool
+    n_max   = max(p.shape[0] for p in packets_list)
+    B       = len(packets_list)
+    d_pkt   = packets_list[0].shape[1]
 
-    return packets, ctx, labels, mask
+    padded  = torch.zeros(B, n_max, d_pkt, dtype=torch.float32)
+    mask    = torch.zeros(B, n_max, dtype=torch.bool)
+
+    for i, pkt in enumerate(packets_list):
+        n = pkt.shape[0]
+        padded[i, :n] = pkt
+        mask[i, :n]   = True
+
+    ctx_batch    = torch.stack([c.float() for c in ctx_list],  dim=0)  # (B, d_ctx)
+    label_batch  = torch.tensor(labels, dtype=torch.int64)              # (B,)
+
+    return padded, ctx_batch, mask, label_batch
+
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+def _parse_seq(s: str, typ):
+    """Parse a semicolon-separated string into a typed list."""
+    if not s.strip():
+        return []
+    return [typ(x) for x in s.split(";") if x.strip()]

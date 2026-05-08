@@ -1,4 +1,14 @@
-from .dataset import FlowDataset, collate_flows
-from .features import extract_flow_features
+"""Phase 0 — data pipeline package."""
 
-__all__ = ["FlowDataset", "collate_flows", "extract_flow_features"]
+from .features import FlowFeatureExtractor, PACKET_FEAT_DIM, CTX_FEAT_DIM
+from .dataset  import FlowDataset, collate_flows
+from .loaders  import build_loaders
+
+__all__ = [
+    "FlowFeatureExtractor",
+    "PACKET_FEAT_DIM",
+    "CTX_FEAT_DIM",
+    "FlowDataset",
+    "collate_flows",
+    "build_loaders",
+]
