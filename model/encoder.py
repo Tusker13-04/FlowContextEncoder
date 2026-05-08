@@ -1,140 +1,140 @@
 """
-FlowContextEncoder — full model.
+FlowContextEncoder  — full pipeline.
 
-Architecture:
-    pkt_embed  →  pos_enc  →  MambaBlock[0]
-    → FiLM(context)  →  MambaBlock[1..n-1]
-    → ctx_residual  →  MaskedGAP  →  MLP head  →  L2-norm
+  Packets  (B, N, d_in)  +  Context (B, d_ctx)  +  Mask (B, N)
+      │
+      ├── pkt_embed   : Linear(d_in  → d_model)
+      ├── pos_enc     : learnable positional embedding (max_len, d_model)
+      ├── MambaBlock  : block 0
+      ├── FiLM        : context fusion after block 0
+      ├── MambaBlock  : blocks 1 … n_layers-1
+      ├── ctx_proj    : Linear(d_ctx → d_model) added to every position
+      ├── norm        : LayerNorm(d_model)
+      ├── masked_gap  : masked global average pool  → (B, d_model)
+      ├── proj_head   : 2-layer MLP  → (B, d_embed)
+      └── L2 norm     → embedding  (B, d_embed)  on unit hypersphere
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from .mamba_block import MambaBlock
-
-
-class SinusoidalPositionalEncoding(nn.Module):
-    """Standard fixed sinusoidal PE — no learned parameters, generalises to any N."""
-    def __init__(self, d_model: int, max_len: int = 256, dropout: float = 0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div[:d_model // 2])
-        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(x + self.pe[:, :x.size(1)])
-
-
-class FiLMFusion(nn.Module):
-    """
-    Feature-wise Linear Modulation.
-    Conditions entire sequence on network context c:
-        x = (1 + gamma(c)) * x + beta(c)
-    Placed after Block 0 so context modulates an already-rich packet representation.
-    """
-    def __init__(self, d_ctx: int, d_model: int):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(d_ctx, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, 2 * d_model),  # outputs [gamma, beta]
-        )
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)  # init as identity (no shift at start)
-
-    def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
-        """
-        x:   (B, N, d_model)
-        ctx: (B, d_ctx)
-        """
-        gb     = self.mlp(ctx)                     # (B, 2*d_model)
-        gamma, beta = gb.chunk(2, dim=-1)          # (B, d_model) each
-        return (1 + gamma.unsqueeze(1)) * x + beta.unsqueeze(1)
+from .film import FiLM
 
 
 class FlowContextEncoder(nn.Module):
     """
-    Full flow encoder.
-
     Args:
-        d_in    : per-packet feature dimension          (default 8)
-        d_ctx   : network context dimension             (default 4: RTT, jitter, loss, tput)
-        d_model : internal model dimension              (default 128)
-        d_emb   : output embedding dimension            (default 128)
-        n_layers: number of Mamba blocks                (default 4)
-        d_state : SSM state dimension per MambaBlock    (default 16)
-        max_len : maximum flow length (packets)         (default 256)
-        dropout : dropout probability                   (default 0.1)
+        d_in      : number of per-packet input features
+        d_ctx     : dimension of the network-context vector  (RTT, jitter, …)
+        d_model   : internal model dimension
+        d_embed   : final embedding dimension (L2-normalised)
+        n_layers  : number of MambaBlocks
+        d_state   : SSM state size
+        d_conv    : causal conv kernel size in MambaBlock
+        expand    : inner expansion ratio in MambaBlock
+        max_len   : max supported sequence length (for positional embedding)
+        proj_mult : MLP head hidden dim = d_model * proj_mult
     """
 
     def __init__(
         self,
-        d_in:    int = 8,
-        d_ctx:   int = 4,
-        d_model: int = 128,
-        d_emb:   int = 128,
-        n_layers:int = 4,
+        d_in: int = 6,
+        d_ctx: int = 4,
+        d_model: int = 64,
+        d_embed: int = 128,
+        n_layers: int = 3,
         d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
         max_len: int = 256,
-        dropout: float = 0.1,
+        proj_mult: int = 2,
     ):
         super().__init__()
-        self.pkt_embed = nn.Linear(d_in, d_model)
-        self.pos_enc   = SinusoidalPositionalEncoding(d_model, max_len, dropout)
 
-        # Mamba blocks
-        self.blocks    = nn.ModuleList([
-            MambaBlock(d_model, d_state=d_state) for _ in range(n_layers)
+        self.d_model = d_model
+        self.d_embed = d_embed
+        self.n_layers = n_layers
+
+        # --- Input projection ---
+        self.pkt_embed = nn.Linear(d_in, d_model)
+
+        # --- Learnable positional embeddings ---
+        self.pos_emb = nn.Embedding(max_len, d_model)
+        nn.init.normal_(self.pos_emb.weight, std=0.02)
+
+        # --- Mamba layers ---
+        self.blocks = nn.ModuleList([
+            MambaBlock(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            for _ in range(n_layers)
         ])
 
-        # FiLM fusion after block 0
-        self.film      = FiLMFusion(d_ctx, d_model)
+        # --- FiLM context fusion (applied after block 0) ---
+        self.film = FiLM(d_model, d_ctx)
 
-        # Late context residual (additive reinforcement after all blocks)
-        self.ctx_proj  = nn.Linear(d_ctx, d_model)
+        # --- Additive context injection (applied to all positions before GAP) ---
+        self.ctx_proj = nn.Linear(d_ctx, d_model, bias=False)
 
-        # MLP projection head
-        self.head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_emb),
+        # --- Final normalisation ---
+        self.norm = nn.LayerNorm(d_model)
+
+        # --- Projection head: 2-layer MLP with GELU ---
+        h_dim = d_model * proj_mult
+        self.proj_head = nn.Sequential(
+            nn.Linear(d_model, h_dim),
+            nn.GELU(),
+            nn.Linear(h_dim, d_embed),
         )
 
     def forward(
         self,
         packets: torch.Tensor,
-        context: torch.Tensor,
-        mask:    torch.Tensor,
+        ctx: torch.Tensor,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
-            packets: (B, N, d_in)
-            context: (B, d_ctx)
-            mask:    (B, N)  — True for real packets, False for padding
+            packets : (B, N, d_in)   — per-packet feature matrix
+            ctx     : (B, d_ctx)     — per-flow context vector  (RTT, jitter, …)
+            mask    : (B, N) bool    — True for real packets, False for padding
+                      If None, all positions treated as real.
         Returns:
-            z: (B, d_emb)  — L2-normalised flow embedding
+            z : (B, d_embed)  — L2-normalised flow embedding
         """
-        x = self.pos_enc(self.pkt_embed(packets))   # (B, N, d_model)
+        B, N, _ = packets.shape
+        device   = packets.device
 
-        x = self.blocks[0](x)                       # first Mamba block
-        x = self.film(x, context)                   # inject RTT/jitter via FiLM
+        # --- Packet embedding + positional encoding ---
+        x = self.pkt_embed(packets)                             # (B, N, d_model)
+        pos = torch.arange(N, device=device).unsqueeze(0)      # (1, N)
+        x = x + self.pos_emb(pos)                              # broadcast over B
 
-        for blk in self.blocks[1:]:                 # remaining blocks
-            x = blk(x)
+        # --- Default mask: all valid ---
+        if mask is None:
+            mask = torch.ones(B, N, dtype=torch.bool, device=device)
 
-        # Late context residual — broadcast context over sequence
-        x = x + self.ctx_proj(context).unsqueeze(1)
+        # --- Mamba blocks with FiLM fusion after block 0 ---
+        for i, block in enumerate(self.blocks):
+            x = block(x)                     # (B, N, d_model)
+            if i == 0:
+                x = self.film(x, ctx)        # context modulation
 
-        # Masked Global Average Pooling
-        m = mask.float().unsqueeze(-1)              # (B, N, 1)
-        pooled = (x * m).sum(1) / m.sum(1).clamp(min=1.0)  # (B, d_model)
+        # --- Additive context injection before pooling ---
+        ctx_vec = self.ctx_proj(ctx).unsqueeze(1)               # (B, 1, d_model)
+        x = x + ctx_vec                                         # broadcast over N
 
-        # Project and L2-normalise
-        z = self.head(pooled)                       # (B, d_emb)
-        return F.normalize(z, p=2, dim=-1)
+        x = self.norm(x)                                        # (B, N, d_model)
+
+        # --- Masked Global Average Pooling ---
+        m = mask.float().unsqueeze(-1)                          # (B, N, 1)
+        pooled = (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)  # (B, d_model)
+
+        # --- Projection head + L2 normalisation ---
+        z = self.proj_head(pooled)                              # (B, d_embed)
+        z = F.normalize(z, p=2, dim=-1)                        # unit hypersphere
+        return z
+
+    @property
+    def num_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

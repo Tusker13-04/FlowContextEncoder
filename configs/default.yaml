@@ -1,0 +1,57 @@
+# FlowContextEncoder — default hyper-parameters (Phase 0)
+# Override any field via CLI:  python train.py --config configs/default.yaml key=value
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  npz_train: null          # path to train .npz; null = use synthetic data
+  npz_val:   null          # path to val   .npz; null = use synthetic data
+  n_synth_train: 2000      # synthetic flows for training  (ignored if npz_train set)
+  n_synth_val:   400       # synthetic flows for validation
+  n_classes: 5             # video / gaming / VoIP / bulk / XR
+  max_len: 128             # max packets per flow (pad/truncate)
+  batch_size: 64
+  num_workers: 0           # set >0 on Linux for multiprocess loading
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  d_in: 6                  # per-packet feature dim  (matches features.py D_IN)
+  d_ctx: 4                 # context vector dim       (matches features.py D_CTX)
+  d_model: 64              # internal model dimension
+  d_embed: 128             # output embedding dimension
+  n_layers: 3              # number of MambaBlocks
+  d_state: 16              # SSM state size
+  d_conv: 4                # causal conv kernel size
+  expand: 2                # d_inner = d_model * expand
+  max_len: 128             # must match data.max_len
+  proj_mult: 2             # MLP head hidden = d_model * proj_mult
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  temperature: 0.07        # SupConLoss temperature τ
+
+# ── Optimiser ─────────────────────────────────────────────────────────────────
+optimiser:
+  name: AdamW
+  lr: 3.0e-4
+  weight_decay: 1.0e-2
+  betas: [0.9, 0.999]
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+scheduler:
+  name: CosineAnnealingLR
+  T_max: 30                # = n_epochs
+  eta_min: 1.0e-6
+
+# ── Training ──────────────────────────────────────────────────────────────────
+train:
+  n_epochs: 30
+  log_every: 5             # log metrics every N epochs
+  save_dir: checkpoints/
+  save_best: true          # save checkpoint with lowest val loss
+  seed: 42
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+eval:
+  knn_k: 5                 # k for k-NN classifier on embeddings
+  intra_class_target: 0.7  # KPI: intra-class cosine sim
+  inter_class_target: 0.3  # KPI: inter-class cosine sim (must be < this)

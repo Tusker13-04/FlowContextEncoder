@@ -1,12 +1,28 @@
 """
-MambaBlock — Selective State Space Model with Parallel Associative Scan.
+MambaBlock  — one selective SSM layer.
 
-Key design choices:
-  - Input-dependent B, C, dt (selective SSM, not fixed S4)
-  - Zero-order hold (ZOH) discretisation
-  - Blelloch parallel scan: O(N log N), fully GPU-parallelisable, no CUDA extensions
-  - Causal Conv1d (k=4) for local context mixing before SSM
-  - SiLU gating on output (Mamba paper)
+Data flow (per block):
+  x_in  (B, N, d_model)
+    │
+    ├─ in_proj  → [x_stream, z_gate]   (B, N, 2*d_inner)  — expand & gate split
+    │
+    ├─ conv1d   → x_stream             causal local mixing  (kernel=4, groups=d_inner)
+    │
+    ├─ x_proj   → B_ssm, C_ssm, Δ_raw  input-dependent SSM params per timestep
+    │
+    ├─ dt_proj  → Δ  (softplus)         expand scalar Δ to all channels
+    │
+    ├─ ZOH discretise:
+    │     Ā = exp(Δ ⊙ A)              A = -exp(A_log)  fixed learnable
+    │     B̄ = Δ ⊙ B_ssm ⊙ x_stream
+    │
+    ├─ parallel_scan(Ā, B̄)  → h       (B, N, d_inner)
+    │
+    ├─ y = Σ_d (h ⊙ C_ssm)            selective readout
+    │
+    ├─ y = y * silu(z_gate)            gating
+    │
+    └─ out_proj → x_out  (B, N, d_model)  + residual
 """
 
 import torch
@@ -14,157 +30,148 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-
-class ParallelScan(nn.Module):
-    """
-    Blelloch parallel prefix scan for linear recurrences:
-        h_t = A_t * h_{t-1} + B_t * x_t
-
-    Composition rule for two consecutive maps:
-        (A2, B2) o (A1, B1) = (A2*A1, A2*B1 + B2)
-
-    Args:
-        A: (B, N, d_inner, d_state) — diagonal transition matrices
-        B: (B, N, d_inner, d_state) — input matrices (already scaled by x)
-
-    Returns:
-        h: (B, N, d_inner, d_state) — all prefix hidden states
-    """
-
-    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-        B_sz, N, d_inner, d_state = A.shape
-        device = A.device
-
-        # Pad to next power of 2
-        pad_len = (1 << math.ceil(math.log2(max(N, 2)))) - N
-        if pad_len > 0:
-            A = F.pad(A, (0, 0, 0, 0, 0, pad_len), value=1.0)  # pad A with 1 (identity)
-            B = F.pad(B, (0, 0, 0, 0, 0, pad_len), value=0.0)  # pad B with 0 (zero input)
-        N_pad = A.shape[1]
-
-        pa, pb = A.clone(), B.clone()
-
-        # Up-sweep: reduce pairs up the tree
-        stride = 1
-        while stride < N_pad:
-            idx = torch.arange(stride - 1, N_pad, step=2 * stride, device=device)
-            left  = idx
-            right = (idx + stride).clamp(max=N_pad - 1)
-
-            # Compose: right absorbs left
-            new_b = pa[:, right] * pb[:, left] + pb[:, right]  # A2*B1 + B2
-            new_a = pa[:, right] * pa[:, left]                  # A2*A1
-
-            pb[:, right] = new_b
-            pa[:, right] = new_a
-            stride *= 2
-
-        # Down-sweep: distribute prefix back down
-        stride = N_pad // 2
-        while stride >= 1:
-            idx = torch.arange(stride - 1, N_pad - stride, step=2 * stride, device=device)
-            left  = idx
-            right = idx + stride
-
-            tmp_a = pa[:, left].clone()
-            tmp_b = pb[:, left].clone()
-
-            pa[:, left]  = pa[:, right]
-            pb[:, left]  = pb[:, right]
-            pa[:, right] = pa[:, right] * tmp_a
-            pb[:, right] = pa[:, right] * tmp_b + pb[:, right]  # NOTE: pa already updated above
-            stride //= 2
-
-        # Trim back to original length
-        return pb[:, :B_sz.bit_length() and N, :, :]  if False else pb[:, :N, :, :]
+from .ssm import parallel_scan
 
 
 class MambaBlock(nn.Module):
     """
-    One selective SSM block.
-
-    Hyperparameters (following Mamba paper defaults):
-        d_model  : input/output dimension
-        d_inner  : expansion factor × d_model  (default 2x)
-        d_state  : SSM state dimension          (default 16)
-        d_conv   : causal conv kernel size      (default 4)
+    Args:
+        d_model   : model dimension (must equal d_inner when expand=1)
+        d_inner   : inner / expanded dimension  (default: d_model * expand)
+        d_state   : SSM state size (rank of A, B, C matrices)
+        d_conv    : causal conv1d kernel size
+        expand    : expansion ratio for d_inner
+        dt_rank   : rank of Δ projection  ('auto' → ceil(d_model/16))
+        dt_min/max: clamp range for softplus Δ initialisation
+        dt_scale  : init scale for dt_proj bias
     """
 
-    def __init__(self, d_model: int, d_inner: int = None, d_state: int = 16, d_conv: int = 4):
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dt_rank: str | int = "auto",
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_scale: float = 1.0,
+    ):
         super().__init__()
-        self.d_model  = d_model
-        self.d_inner  = d_inner or 2 * d_model
-        self.d_state  = d_state
-        self.d_conv   = d_conv
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv  = d_conv
+        self.d_inner = d_model * expand
 
-        di = self.d_inner
-        ds = self.d_state
+        self.dt_rank = math.ceil(d_model / 16) if dt_rank == "auto" else dt_rank
 
-        # Input projection: projects to content stream x and gate z
-        self.in_proj  = nn.Linear(d_model, 2 * di, bias=False)
+        # --- Input projection: x + gate in one shot ---
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
 
-        # Causal depthwise Conv1d for local context (pads left only)
-        self.conv1d   = nn.Conv1d(di, di, kernel_size=d_conv, groups=di, bias=True,
-                                  padding=d_conv - 1)  # trim right in forward
+        # --- Causal depthwise conv over the sequence ---
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,   # causal: trim right later
+            bias=True,
+        )
 
-        # Selective projections (produce B, C, log_dt from x)
-        self.x_proj   = nn.Linear(di, ds + ds + 1, bias=False)  # B + C + dt_rank
-        self.dt_proj  = nn.Linear(1, di, bias=True)             # expand dt scalar to di channels
+        # --- Selective parameter projections ---
+        # B_ssm (d_state), C_ssm (d_state), dt_raw (dt_rank)  — all per timestep
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
 
-        # A: fixed log-decay (learnable but time-invariant)
-        A = torch.arange(1, ds + 1, dtype=torch.float32).unsqueeze(0).expand(di, -1)
-        self.A_log    = nn.Parameter(torch.log(A))               # (di, ds)
-        self.D        = nn.Parameter(torch.ones(di))             # skip connection scalar
+        # dt_proj: dt_rank → d_inner  (with init to spread Δ in [dt_min, dt_max])
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        dt_init_std = self.dt_rank ** -0.5 * dt_scale
+        nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        # Bias initialised so softplus(bias) ≈ uniform in [dt_min, dt_max]
+        dt_bias = torch.exp(
+            torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        )
+        # Inverse softplus
+        self.dt_proj.bias = nn.Parameter(
+            torch.log(torch.expm1(dt_bias)), requires_grad=True
+        )
 
-        self.out_proj = nn.Linear(di, d_model, bias=False)
-        self.norm     = nn.LayerNorm(d_model)
-        self.scan     = ParallelScan()
+        # --- Fixed learnable log-decay A ---
+        # A = -exp(A_log) ensures A < 0 (stable decay)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0)  # (1, d_state)
+        A = A.repeat(self.d_inner, 1)                                         # (d_inner, d_state)
+        self.A_log = nn.Parameter(torch.log(A), requires_grad=True)
 
-    def forward(self, u: torch.Tensor) -> torch.Tensor:
+        # --- D: skip / residual connection in SSM output ---
+        self.D = nn.Parameter(torch.ones(self.d_inner), requires_grad=True)
+
+        # --- Output projection ---
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+        # --- Layer norm before each block ---
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            u: (B, N, d_model)
+            x : (B, N, d_model)
         Returns:
-            (B, N, d_model)
+            out : (B, N, d_model)   residual added internally
         """
-        B_sz, N, _ = u.shape
-        residual = u
+        residual = x
+        x = self.norm(x)   # pre-norm
 
-        # Split into content stream and gate
-        xz   = self.in_proj(u)                          # (B, N, 2*di)
-        x, z = xz.chunk(2, dim=-1)                      # (B, N, di) each
+        B, N, _ = x.shape
 
-        # Causal Conv1d (transpose for Conv1d, trim causal padding)
-        x_conv = self.conv1d(x.transpose(1, 2))         # (B, di, N + d_conv - 1)
-        x      = x_conv[:, :, :N].transpose(1, 2)       # (B, N, di)  — causal trim
-        x      = F.silu(x)
+        # 1. Expand + gate split
+        xz = self.in_proj(x)                   # (B, N, 2*d_inner)
+        x_s, z = xz.chunk(2, dim=-1)           # each (B, N, d_inner)
 
-        # Selective projections
-        proj   = self.x_proj(x)                         # (B, N, ds + ds + 1)
-        B_ssm  = proj[..., :self.d_state]               # (B, N, ds)
-        C_ssm  = proj[..., self.d_state:2*self.d_state] # (B, N, ds)
-        log_dt = proj[..., -1:]                         # (B, N, 1)
+        # 2. Causal conv1d  (operates on channel dim, sequence is "time")
+        x_s = x_s.transpose(1, 2)              # (B, d_inner, N)
+        x_s = self.conv1d(x_s)[:, :, :N]       # trim right padding → causal
+        x_s = F.silu(x_s)
+        x_s = x_s.transpose(1, 2)              # (B, N, d_inner)
 
-        # Time step (always positive)
-        dt     = F.softplus(self.dt_proj(log_dt))       # (B, N, di)
+        # 3. Selective projections
+        xp  = self.x_proj(x_s)                # (B, N, dt_rank + 2*d_state)
+        dt_raw  = xp[..., :self.dt_rank]                          # (B, N, dt_rank)
+        B_ssm   = xp[..., self.dt_rank : self.dt_rank + self.d_state]  # (B, N, d_state)
+        C_ssm   = xp[..., self.dt_rank + self.d_state :]          # (B, N, d_state)
 
-        # Discretise A using ZOH:  Ã_t = exp(Δ_t ⊗ A)
-        A      = -torch.exp(self.A_log)                 # (di, ds) — negative for stability
-        # Expand for broadcasting: (B, N, di, ds)
-        A_bar  = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))  # (B, N, di, ds)
-        B_bar  = dt.unsqueeze(-1) * B_ssm.unsqueeze(2)                      # (B, N, di, ds)
-        # Scale by input x
-        Bx     = B_bar * x.unsqueeze(-1)                # (B, N, di, ds)
+        # 4. Discretise Δ (softplus ensures positivity)
+        dt = F.softplus(self.dt_proj(dt_raw))  # (B, N, d_inner)
 
-        # Parallel scan → all hidden states
-        h      = self.scan(A_bar, Bx)                   # (B, N, di, ds)
+        # 5. ZOH discretise A and B
+        A = -torch.exp(self.A_log.float())     # (d_inner, d_state)  < 0
+        # Ā_t = exp(Δ_t ⊙ A)  — shape broadcast: (B, N, d_inner, d_state)
+        dA = torch.exp(
+            dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)
+        )                                       # (B, N, d_inner, d_state)
+        # B̄_t = Δ_t ⊙ x_t ⊙ B_t  — note B_ssm is (B, N, d_state)
+        dB = (
+            dt.unsqueeze(-1)
+            * x_s.unsqueeze(-1)
+            * B_ssm.unsqueeze(2)
+        )                                       # (B, N, d_inner, d_state)
 
-        # Read out via C
-        y      = (h * C_ssm.unsqueeze(2)).sum(-1)       # (B, N, di)
-        y      = y + self.D.unsqueeze(0).unsqueeze(0) * x  # skip connection D
+        # 6. Parallel scan across N for each (d_inner, d_state) independently
+        # Flatten the last two dims so parallel_scan sees (B, N, d_inner*d_state)
+        dA_flat = dA.reshape(B, N, self.d_inner * self.d_state)
+        dB_flat = dB.reshape(B, N, self.d_inner * self.d_state)
 
-        # SiLU gate and output projection
-        y      = y * F.silu(z)                          # (B, N, di)
-        out    = self.out_proj(y)                        # (B, N, d_model)
+        h_flat = parallel_scan(dA_flat, dB_flat)   # (B, N, d_inner*d_state)
+        h = h_flat.reshape(B, N, self.d_inner, self.d_state)  # (B, N, d_inner, d_state)
 
-        return self.norm(out + residual)
+        # 7. Selective readout:  y_t = Σ_s  h_t[s] * C_t[s]
+        y = (h * C_ssm.unsqueeze(2)).sum(-1)    # (B, N, d_inner)
+
+        # 8. D skip connection
+        y = y + x_s * self.D.unsqueeze(0).unsqueeze(0)
+
+        # 9. Gate
+        y = y * F.silu(z)                       # (B, N, d_inner)
+
+        # 10. Project back to d_model and add residual
+        out = self.out_proj(y) + residual       # (B, N, d_model)
+        return out
