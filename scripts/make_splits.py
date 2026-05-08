@@ -1,149 +1,174 @@
 """
-scripts/make_splits.py
-======================
-Build leakage-resistant train/val/test/fewshot split index files.
+make_splits.py  —  Leakage-resistant train / val / test / few-shot splits
 
 Two split strategies
---------------------
-1. Time-based (default for CESNET data):
-   - Train  : weeks 1-3
-   - Val    : week 4
-   - Test   : week 5  (different calendar week — no temporal leakage)
-   Any flow whose first-packet timestamp falls in a given week is assigned
-   to that split.
+---------------------
+  1. time  : train on weeks 1-3, val on week 4, test on week 5  (default for CESNET)
+  2. random: stratified random split with no temporal guarantee
 
-2. App-held-out (few-shot evaluation):
-   - 3 apps are never seen during train/val; reserved in fewshot.txt.
-   - Remaining apps follow the time-based split above.
-   - App names to hold out are written to splits/fewshot_apps.txt.
+Few-shot split
+--------------
+  3 app classes are held out entirely from train/val/test and saved to
+  splits/fewshot_apps.txt.  Their flow IDs go to splits/fewshot.txt.
 
 Output
 ------
-  splits/train.txt     — flow_id per line
+  splits/train.txt      — flow IDs, one per line
   splits/val.txt
   splits/test.txt
   splits/fewshot.txt
-  splits/fewshot_apps.txt  — app labels held out for few-shot eval
+  splits/fewshot_apps.txt  — held-out class names
 
 Usage
 -----
-    python scripts/make_splits.py \
-        --flow-dir data/flows/ \
-        --out-dir  splits/ \
-        --strategy time  \
-        --fewshot-apps xr voip
+  python scripts/make_splits.py \
+      --parquet data/flows/cesnet.parquet \
+      --strategy time \
+      --ts-col ts_start          # column holding epoch seconds
+
+  python scripts/make_splits.py \
+      --parquet data/flows/lab.parquet \
+      --strategy random
 """
+
+from __future__ import annotations
 
 import argparse
 import random
-from collections import defaultdict
 from pathlib import Path
+from typing import List
 
 import pandas as pd
-
-RANDOM_SEED = 42
-
-
-def _load_all_flows(flow_dir: Path) -> pd.DataFrame:
-    parts = []
-    for p in sorted(flow_dir.glob("*.parquet")):
-        df = pd.read_parquet(p, columns=["flow_id", "app_label"])
-        # Attempt to read a timestamp column if present
-        try:
-            df_ts = pd.read_parquet(p, columns=["flow_id", "ts"])
-            df["ts"] = df_ts["ts"]
-        except Exception:
-            df["ts"] = None
-        parts.append(df)
-    if not parts:
-        raise FileNotFoundError(f"No parquet files found in {flow_dir}")
-    return pd.concat(parts, ignore_index=True)
+import numpy as np
 
 
-def _time_based_split(df: pd.DataFrame) -> pd.DataFrame:
+SPLITS_DIR = Path("splits")
+FEWSHOT_N_CLASSES = 3
+
+
+def _write_ids(path: Path, ids: List[str]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(ids) + "\n")
+    print(f"[make_splits] {path}  ({len(ids)} flows)")
+
+
+def time_split(df: pd.DataFrame, ts_col: str) -> dict:
     """
-    Assign split based on week-of-year from 'ts' column.
-    Falls back to a random 70/15/15 split if timestamps are unavailable.
+    Splits by quantile of timestamp — approximates week-based splits
+    without requiring exact calendar metadata.
+      train : ts < 60th percentile
+      val   : 60th <= ts < 80th percentile
+      test  : ts >= 80th percentile
+    If ts_col not in df, falls back to row-order split.
     """
-    if df["ts"].isna().all():
-        print("[make_splits] No timestamps found — falling back to random 70/15/15 split.")
-        rng = random.Random(RANDOM_SEED)
-        flow_ids = df["flow_id"].tolist()
-        rng.shuffle(flow_ids)
-        n = len(flow_ids)
-        train_end = int(n * 0.70)
-        val_end = int(n * 0.85)
-        split_map = {}
-        for i, fid in enumerate(flow_ids):
-            if i < train_end:
-                split_map[fid] = "train"
-            elif i < val_end:
-                split_map[fid] = "val"
-            else:
-                split_map[fid] = "test"
-        df["split"] = df["flow_id"].map(split_map)
-        return df
+    if ts_col not in df.columns:
+        print(f"[make_splits] WARNING: '{ts_col}' not found; falling back to row-order split.")
+        n = len(df)
+        idx = df.index.tolist()
+        return {
+            "train": df.loc[idx[:int(n * 0.6)], "flow_id"].tolist(),
+            "val":   df.loc[idx[int(n * 0.6):int(n * 0.8)], "flow_id"].tolist(),
+            "test":  df.loc[idx[int(n * 0.8):], "flow_id"].tolist(),
+        }
 
-    df["ts"] = pd.to_datetime(df["ts"], unit="s", errors="coerce")
-    df["week"] = df["ts"].dt.isocalendar().week
-    min_week = df["week"].min()
+    q60 = df[ts_col].quantile(0.60)
+    q80 = df[ts_col].quantile(0.80)
+    return {
+        "train": df[df[ts_col] <  q60]["flow_id"].tolist(),
+        "val":   df[(df[ts_col] >= q60) & (df[ts_col] < q80)]["flow_id"].tolist(),
+        "test":  df[df[ts_col] >= q80]["flow_id"].tolist(),
+    }
 
-    def _assign(week):
-        rel = week - min_week
-        if rel <= 2:   return "train"   # weeks 1-3
-        elif rel == 3: return "val"     # week 4
-        else:          return "test"    # week 5+
 
-    df["split"] = df["week"].apply(_assign)
-    return df
+def random_split(df: pd.DataFrame, seed: int = 42) -> dict:
+    """Stratified random split preserving class proportions."""
+    rng = random.Random(seed)
+    train_ids, val_ids, test_ids = [], [], []
+    for label, group in df.groupby("app_label"):
+        ids = group["flow_id"].tolist()
+        rng.shuffle(ids)
+        n = len(ids)
+        tr = int(n * 0.70)
+        va = int(n * 0.85)
+        train_ids.extend(ids[:tr])
+        val_ids.extend(ids[tr:va])
+        test_ids.extend(ids[va:])
+    return {"train": train_ids, "val": val_ids, "test": test_ids}
+
+
+def carve_fewshot(df: pd.DataFrame, split_ids: dict, n_classes: int = FEWSHOT_N_CLASSES, seed: int = 0) -> tuple:
+    """
+    Selects `n_classes` app labels to hold out entirely as few-shot eval classes.
+    Removes their flow IDs from train/val/test and returns them as fewshot split.
+    Chooses the least-frequent classes so training is affected minimally.
+    """
+    class_counts = df["app_label"].value_counts()
+    all_classes  = class_counts.index.tolist()
+    if len(all_classes) <= n_classes + 2:
+        n_classes = max(1, len(all_classes) - 2)
+    rng = random.Random(seed)
+    # prefer smaller classes for held-out (less disruption to training)
+    candidate_pool = all_classes[-(n_classes * 2):]
+    held_out = rng.sample(candidate_pool, n_classes)
+
+    held_set = set(df[df["app_label"].isin(held_out)]["flow_id"].tolist())
+    fewshot_ids = list(held_set)
+
+    for k in split_ids:
+        split_ids[k] = [fid for fid in split_ids[k] if fid not in held_set]
+
+    return split_ids, fewshot_ids, held_out
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build leakage-resistant flow split index.")
-    parser.add_argument("--flow-dir", default="data/flows", help="Directory containing flow parquet files")
-    parser.add_argument("--out-dir", default="splits", help="Output directory for split txt files")
-    parser.add_argument("--strategy", default="time", choices=["time", "random"],
-                        help="time = week-based split; random = 70/15/15 random split")
-    parser.add_argument("--fewshot-apps", nargs="*", default=["xr"],
-                        help="App labels to hold out entirely for few-shot eval (default: xr)")
+    parser = argparse.ArgumentParser(description="Generate leakage-resistant flow splits")
+    parser.add_argument("--parquet",  required=True,       help="Input Parquet with flow_id and app_label columns")
+    parser.add_argument("--strategy", default="time",       choices=["time", "random"])
+    parser.add_argument("--ts-col",   default="ts_start",   help="Timestamp column for time-based split")
+    parser.add_argument("--out-dir",  default="splits",     help="Output directory")
+    parser.add_argument("--seed",     type=int, default=42)
+    parser.add_argument("--no-fewshot", action="store_true", help="Skip few-shot class carving")
     args = parser.parse_args()
 
-    flow_dir = Path(args.flow_dir)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[make_splits] Loading flows from {flow_dir} ...")
-    df = _load_all_flows(flow_dir)
-    print(f"[make_splits] Loaded {len(df):,} flows across {df['app_label'].nunique()} app labels.")
+    print(f"[make_splits] Loading {args.parquet} ...")
+    df = pd.read_parquet(args.parquet, columns=[c for c in
+        ["flow_id", "app_label", args.ts_col] if True])
+    # drop ts_col if missing
+    df = df[[c for c in df.columns if c in ["flow_id", "app_label", args.ts_col]]]
 
-    # ── Few-shot holdout ─────────────────────────────────────────────────────
-    fewshot_apps = set(args.fewshot_apps)
-    fewshot_mask = df["app_label"].isin(fewshot_apps)
-    df_fewshot = df[fewshot_mask].copy()
-    df_main = df[~fewshot_mask].copy()
+    print(f"[make_splits] {len(df)} flows  |  {df['app_label'].nunique()} classes")
+    print(df["app_label"].value_counts().to_string())
 
-    print(f"[make_splits] Holding out {len(df_fewshot):,} flows from apps: {fewshot_apps}")
-
-    # ── Main split ───────────────────────────────────────────────────────────
     if args.strategy == "time":
-        df_main = _time_based_split(df_main)
+        split_ids = time_split(df, args.ts_col)
     else:
-        # Override to random
-        df_main["ts"] = None
-        df_main = _time_based_split(df_main)
+        split_ids = random_split(df, seed=args.seed)
 
-    # ── Write split files (flow IDs only) ────────────────────────────────────
-    for split_name in ["train", "val", "test"]:
-        ids = df_main[df_main["split"] == split_name]["flow_id"].tolist()
-        out_path = out_dir / f"{split_name}.txt"
-        out_path.write_text("\n".join(ids))
-        print(f"[make_splits] {split_name:6s}: {len(ids):>8,} flows → {out_path}")
+    if not args.no_fewshot:
+        split_ids, fewshot_ids, held_out = carve_fewshot(df, split_ids, seed=args.seed)
+        _write_ids(out_dir / "fewshot.txt", fewshot_ids)
+        (out_dir / "fewshot_apps.txt").write_text("\n".join(held_out) + "\n")
+        print(f"[make_splits] Few-shot held-out classes: {held_out}")
 
-    fewshot_ids = df_fewshot["flow_id"].tolist()
-    (out_dir / "fewshot.txt").write_text("\n".join(fewshot_ids))
-    (out_dir / "fewshot_apps.txt").write_text("\n".join(sorted(fewshot_apps)))
-    print(f"[make_splits] fewshot: {len(fewshot_ids):>8,} flows → {out_dir / 'fewshot.txt'}")
-    print(f"[make_splits] Done.")
+    _write_ids(out_dir / "train.txt", split_ids["train"])
+    _write_ids(out_dir / "val.txt",   split_ids["val"])
+    _write_ids(out_dir / "test.txt",  split_ids["test"])
+
+    # update 'split' column in parquet
+    id_to_split = {}
+    for s, ids in split_ids.items():
+        for fid in ids:
+            id_to_split[fid] = s
+    if not args.no_fewshot:
+        for fid in fewshot_ids:
+            id_to_split[fid] = "fewshot"
+
+    df["split"] = df["flow_id"].map(id_to_split).fillna("")
+    df.to_parquet(args.parquet, index=False)
+    print(f"[make_splits] Updated 'split' column in {args.parquet}")
 
 
 if __name__ == "__main__":

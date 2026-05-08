@@ -1,141 +1,136 @@
 """
-scripts/capture_lab.py
-======================
-Lab packet-capture wrapper for manual ground-truth collection.
-
-Workflow
---------
-1. Optionally apply tc-netem impairment (high RTT, packet loss, jitter).
-2. Start tcpdump on the target interface.
-3. Wait for the user to run the target app (YouTube, Netflix, game, etc.)
-   — or sleep for --duration seconds in automated mode.
-4. Stop tcpdump, remove impairment.
-5. Call build_flows.py on the resulting pcap.
+capture_lab.py  —  tcpdump wrapper for labelled manual captures
 
 Usage
 -----
-# Manual interactive capture (good/good network):
-    sudo python scripts/capture_lab.py \
-        --label video_streaming \
-        --split train \
-        --iface eth0 \
-        --duration 120
+  # Good network
+  python scripts/capture_lab.py --app youtube --duration 120 --out data/raw/youtube_good.pcap
 
-# Automated bad-network scenario (200ms RTT, 5% loss):
-    sudo python scripts/capture_lab.py \
-        --label gaming \
-        --split test \
-        --iface eth0 \
-        --duration 120 \
-        --netem "delay 200ms 20ms loss 5%"
+  # Bad network (tc-netem impairment)
+  python scripts/capture_lab.py --app netflix --duration 120 \
+      --out data/raw/netflix_bad.pcap \
+      --netem "delay 80ms 20ms distribution normal loss 2%"
 
-Requires: tcpdump (system), tc (iproute2, Linux only).
-Python deps: none beyond stdlib.
+Requires:
+  - tcpdump installed and in PATH (sudo if capturing on a live interface)
+  - tc (iproute2) for netem impairment (Linux only)
+  - python scripts/build_flows.py available
 """
+
+from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import signal
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
-COARSE_CLASSES = {"video_streaming", "gaming", "voip", "web", "xr"}
-OUTPUT_DIR = Path("data/flows")
-RAW_DIR = Path("data/raw")
+
+NETEM_IFACE = os.environ.get("NETEM_IFACE", "eth0")   # interface to impair
+DEFAULT_IFACE = os.environ.get("CAPTURE_IFACE", "any") # interface to capture
 
 
-def _run(cmd: str, check: bool = True):
-    print(f"  $ {cmd}")
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if check and result.returncode != 0:
-        print(f"  [ERROR] {result.stderr.strip()}", file=sys.stderr)
-        sys.exit(result.returncode)
-    return result
+def _run(cmd: list[str], check: bool = True, sudo: bool = False) -> subprocess.CompletedProcess:
+    if sudo and os.geteuid() != 0:
+        cmd = ["sudo"] + cmd
+    print(f"[capture_lab] $ {' '.join(cmd)}")
+    return subprocess.run(cmd, check=check)
 
 
-def apply_netem(iface: str, netem: str):
-    """Apply tc-netem impairment to the given interface."""
-    print(f"[capture_lab] Applying netem impairment: {netem}")
-    _run(f"tc qdisc add dev {iface} root netem {netem}")
+def apply_netem(netem_spec: str):
+    """Apply tc-netem impairment. Idempotent — clears existing qdiscs first."""
+    _run(["tc", "qdisc", "del", "dev", NETEM_IFACE, "root"], check=False, sudo=True)
+    _run(
+        ["tc", "qdisc", "add", "dev", NETEM_IFACE, "root", "netem"] + netem_spec.split(),
+        sudo=True,
+    )
+    print(f"[capture_lab] Netem applied on {NETEM_IFACE}: {netem_spec}")
 
 
-def remove_netem(iface: str):
-    """Remove tc-netem impairment (best-effort)."""
-    _run(f"tc qdisc del dev {iface} root netem", check=False)
+def remove_netem():
+    """Remove all netem qdiscs from the interface."""
+    _run(["tc", "qdisc", "del", "dev", NETEM_IFACE, "root"], check=False, sudo=True)
+    print(f"[capture_lab] Netem removed from {NETEM_IFACE}")
 
 
-def capture(
-    iface: str,
-    pcap_path: Path,
-    duration: int,
-    interactive: bool,
-):
-    """Start tcpdump, wait, then stop."""
-    cmd = f"tcpdump -i {iface} -w {pcap_path} -q"
-    print(f"[capture_lab] Starting capture → {pcap_path}")
-    proc = subprocess.Popen(cmd.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def start_capture(out_pcap: str, iface: str) -> subprocess.Popen:
+    if not shutil.which("tcpdump"):
+        raise RuntimeError("tcpdump not found in PATH")
+    cmd = ["tcpdump", "-i", iface, "-w", out_pcap, "-n", "-q"]
+    if os.geteuid() != 0:
+        cmd = ["sudo"] + cmd
+    print(f"[capture_lab] Starting capture on {iface} → {out_pcap}")
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    if interactive:
-        input("  [capture_lab] Press ENTER when done running the app...")
-    else:
-        print(f"  [capture_lab] Capturing for {duration}s ...")
-        time.sleep(duration)
 
-    proc.terminate()
-    proc.wait()
-    print(f"[capture_lab] Capture complete. pcap saved to {pcap_path}")
+def stop_capture(proc: subprocess.Popen):
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    print("[capture_lab] Capture stopped.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Lab capture wrapper for ground-truth collection.")
-    parser.add_argument("--label", required=True, choices=sorted(COARSE_CLASSES))
-    parser.add_argument("--split", required=True, choices=["train", "val", "test", "fewshot"])
-    parser.add_argument("--iface", default="eth0", help="Network interface to capture on")
-    parser.add_argument("--duration", type=int, default=120, help="Capture duration in seconds (automated mode)")
-    parser.add_argument("--interactive", action="store_true", help="Wait for ENTER instead of fixed duration")
-    parser.add_argument("--netem", default=None,
-                        help="tc-netem impairment string, e.g. 'delay 200ms 20ms loss 5%%'. Omit for good-network scenario.")
-    parser.add_argument("--output", default=str(OUTPUT_DIR), help="Output directory for flow parquet files")
-    parser.add_argument("--keep-pcap", action="store_true", help="Keep raw pcap after converting to parquet")
+    parser = argparse.ArgumentParser(description="Labelled pcap capture with optional netem impairment")
+    parser.add_argument("--app",      required=True, help="App label (e.g. youtube, netflix, gaming)")
+    parser.add_argument("--duration", type=int, default=120, help="Capture duration in seconds")
+    parser.add_argument("--out",      required=True, help="Output pcap path")
+    parser.add_argument("--iface",    default=DEFAULT_IFACE, help="Capture interface")
+    parser.add_argument("--netem",    default=None,
+                        help="tc-netem spec, e.g. 'delay 80ms 20ms loss 2%%'. Omit for good-network.")
+    parser.add_argument("--flows-out", default=None,
+                        help="If set, automatically run build_flows.py and write Parquet here.")
+    parser.add_argument("--no-build", action="store_true",
+                        help="Skip automatic flow building after capture.")
     args = parser.parse_args()
 
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    Path(args.output).mkdir(parents=True, exist_ok=True)
-
-    scenario = "bad" if args.netem else "good"
-    pcap_name = f"{args.label}_{args.split}_{scenario}_{int(time.time())}.pcap"
-    pcap_path = RAW_DIR / pcap_name
-
-    print(f"[capture_lab] Label={args.label}  Split={args.split}  Network={scenario}")
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    scenario = "bad_network" if args.netem else "good_network"
+    print(f"[capture_lab] App={args.app}  Scenario={scenario}  Duration={args.duration}s")
 
     if args.netem:
-        apply_netem(args.iface, args.netem)
+        apply_netem(args.netem)
 
+    proc = start_capture(args.out, args.iface)
+    print(f"[capture_lab] >>> Open {args.app} NOW — capturing for {args.duration}s ...")
     try:
-        capture(args.iface, pcap_path, args.duration, args.interactive)
+        time.sleep(args.duration)
+    except KeyboardInterrupt:
+        print("[capture_lab] Interrupted by user.")
     finally:
+        stop_capture(proc)
         if args.netem:
-            remove_netem(args.iface)
+            remove_netem()
 
-    # Convert pcap → parquet via build_flows.py
-    cmd = (
-        f"python scripts/build_flows.py "
-        f"--source pcap "
-        f"--input {pcap_path} "
-        f"--label {args.label} "
-        f"--split {args.split} "
-        f"--output {args.output}"
-    )
-    print("[capture_lab] Converting pcap → parquet ...")
-    _run(cmd)
+    print(f"[capture_lab] Pcap saved: {args.out}")
 
-    if not args.keep_pcap:
-        pcap_path.unlink(missing_ok=True)
-        print(f"[capture_lab] Removed pcap ({pcap_path}).")
+    # Optionally run flow builder
+    if not args.no_build:
+        flows_out = args.flows_out or args.out.replace(".pcap", "_flows.parquet")
+        build_cmd = [
+            sys.executable, "scripts/build_flows.py",
+            "--input", args.out,
+            "--out",   flows_out,
+            "--label", args.app,
+        ]
+        print(f"[capture_lab] Building flows → {flows_out}")
+        subprocess.run(build_cmd, check=False)
 
-    print("[capture_lab] Done.")
+    # Emit metadata sidecar
+    meta_path = args.out.replace(".pcap", "_meta.txt")
+    with open(meta_path, "w") as f:
+        f.write(f"app={args.app}\n")
+        f.write(f"scenario={scenario}\n")
+        f.write(f"duration_s={args.duration}\n")
+        f.write(f"iface={args.iface}\n")
+        f.write(f"netem={args.netem or 'none'}\n")
+        f.write(f"timestamp={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+    print(f"[capture_lab] Metadata: {meta_path}")
 
 
 if __name__ == "__main__":
